@@ -6,7 +6,8 @@ A Selenium-based utility that loads a Scribd embed and saves it as a PDF.
 
 Key behaviors:
 1. Converts a Scribd document URL to the embed/content URL.
-2. Opens the document in headless Chrome.
+2. Opens the document in a headless Chromium-based browser (Chrome, Brave, or
+   Chromium), detected automatically or chosen on the command line.
 3. Removes UI overlays without stripping layout classes needed for rendering.
 4. Loads pages in bounded batches so memory stays flat on long documents.
 5. Prints each Scribd page to exactly one PDF sheet through the Chrome
@@ -18,6 +19,7 @@ import argparse
 import base64
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -41,6 +43,50 @@ EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_INTERRUPTED = 130
 
+# Only Chromium-based browsers are supported: they all speak the DevTools
+# Protocol commands this exporter relies on and are driven by ChromeDriver.
+BROWSER_CHOICES = ("auto", "chrome", "brave", "chromium")
+AUTO_DETECT_ORDER = ("chrome", "brave", "chromium")
+BROWSER_LABELS = {
+    "chrome": "Google Chrome",
+    "brave": "Brave",
+    "chromium": "Chromium",
+}
+
+# Paths relative to Program Files / Local AppData on Windows.
+WINDOWS_RELATIVE_PATHS = {
+    "chrome": [r"Google\Chrome\Application\chrome.exe"],
+    "brave": [r"BraveSoftware\Brave-Browser\Application\brave.exe"],
+    "chromium": [r"Chromium\Application\chrome.exe"],
+}
+WINDOWS_ROOT_VARIABLES = ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA")
+# Chromium installs often register as chrome.exe too, so it is left out here to
+# avoid reporting Google Chrome as Chromium.
+WINDOWS_REGISTRY_EXECUTABLES = {"chrome": "chrome.exe", "brave": "brave.exe"}
+
+MACOS_PATHS = {
+    "chrome": ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"],
+    "brave": ["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"],
+    "chromium": ["/Applications/Chromium.app/Contents/MacOS/Chromium"],
+}
+
+LINUX_EXECUTABLES = {
+    "chrome": ["google-chrome", "google-chrome-stable", "/opt/google/chrome/chrome"],
+    "brave": [
+        "brave-browser",
+        "brave-browser-stable",
+        "brave",
+        "/opt/brave.com/brave/brave-browser",
+        "/opt/brave.com/brave/brave",
+    ],
+    "chromium": [
+        "chromium",
+        "chromium-browser",
+        "/usr/lib/chromium/chromium",
+        "/snap/bin/chromium",
+    ],
+}
+
 
 def env_int(name, default, minimum=None):
     """Read a positive integer from the environment, ignoring bad values."""
@@ -57,6 +103,23 @@ def env_int(name, default, minimum=None):
     if minimum is not None and value < minimum:
         print(f"Warning: {name}={value} is below {minimum}; using {minimum}.")
         return minimum
+
+    return value
+
+
+def env_choice(name, default, allowed):
+    """Read one of a fixed set of values from the environment."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+
+    value = raw.strip().lower()
+    if value not in allowed:
+        print(
+            f"Warning: {name}={raw!r} is not one of "
+            f"{', '.join(allowed)}; using {default}."
+        )
+        return default
 
     return value
 
@@ -79,11 +142,15 @@ class ExportSettings:
         page_load_timeout_seconds,
         export_batch_size,
         headless,
+        browser="auto",
+        browser_path=None,
     ):
         self.cdp_timeout_seconds = cdp_timeout_seconds
         self.page_load_timeout_seconds = page_load_timeout_seconds
         self.export_batch_size = export_batch_size
         self.headless = headless
+        self.browser = browser
+        self.browser_path = browser_path
 
     @classmethod
     def from_args(cls, args):
@@ -106,12 +173,163 @@ class ExportSettings:
             headless=(
                 False if args.no_headless else env_flag("SCRIBD_HEADLESS", True)
             ),
+            browser=(
+                args.browser
+                if args.browser is not None
+                else env_choice("SCRIBD_BROWSER", "auto", BROWSER_CHOICES)
+            ),
+            browser_path=(
+                args.browser_path
+                if args.browser_path is not None
+                else os.getenv("SCRIBD_BROWSER_PATH") or None
+            ),
         )
 
 
-def build_chrome_options(runtime_profile_dir, headless):
-    """Create Chrome options for reliable headless PDF generation."""
+def windows_registry_browser_paths(executable_name):
+    """
+    Look a browser up in the Windows "App Paths" registry keys.
+
+    Returns an empty list on non-Windows platforms or when the key is absent.
+    """
+    try:
+        import winreg
+    except ImportError:
+        return []
+
+    key_path = (
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
+        f"\\{executable_name}"
+    )
+    found = []
+
+    for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        try:
+            with winreg.OpenKey(root, key_path) as key:
+                value = winreg.QueryValueEx(key, "")[0]
+        except OSError:
+            continue
+
+        if value:
+            found.append(value.strip('"'))
+
+    return found
+
+
+def browser_candidate_paths(browser_key, platform_name=None):
+    """
+    List the places a browser is normally installed on this platform.
+
+    Args:
+        browser_key: One of "chrome", "brave", or "chromium".
+        platform_name: Override for sys.platform, used by the tests.
+
+    Returns:
+        Candidate filesystem paths, most authoritative first. Paths are not
+        checked for existence here.
+    """
+    platform_name = platform_name or sys.platform
+    candidates = []
+
+    if platform_name == "win32":
+        registry_executable = WINDOWS_REGISTRY_EXECUTABLES.get(browser_key)
+        if registry_executable:
+            candidates.extend(windows_registry_browser_paths(registry_executable))
+
+        for variable in WINDOWS_ROOT_VARIABLES:
+            root = os.environ.get(variable)
+            if not root:
+                continue
+
+            for relative in WINDOWS_RELATIVE_PATHS.get(browser_key, []):
+                candidates.append(os.path.join(root, relative))
+
+    elif platform_name == "darwin":
+        for path in MACOS_PATHS.get(browser_key, []):
+            candidates.append(path)
+            # The same bundle may live under the user's own Applications dir.
+            candidates.append(os.path.expanduser("~" + path))
+
+    else:
+        for entry in LINUX_EXECUTABLES.get(browser_key, []):
+            if os.path.isabs(entry):
+                candidates.append(entry)
+            else:
+                resolved = shutil.which(entry)
+                if resolved:
+                    candidates.append(resolved)
+
+    # Preserve order while dropping duplicates.
+    return list(dict.fromkeys(candidates))
+
+
+def find_browser_binary(browser_key, platform_name=None):
+    """Return the first installed binary for a browser, or None."""
+    for candidate in browser_candidate_paths(browser_key, platform_name):
+        if os.path.isfile(candidate):
+            return candidate
+
+    return None
+
+
+def resolve_browser(browser_key, explicit_path=None, platform_name=None):
+    """
+    Decide which browser binary to drive.
+
+    Args:
+        browser_key: "auto", "chrome", "brave", or "chromium".
+        explicit_path: A binary supplied with --browser-path, which wins over
+            detection.
+        platform_name: Override for sys.platform, used by the tests.
+
+    Returns:
+        Tuple of (human readable label, binary path or None). A None path means
+        "let ChromeDriver locate its default browser", which keeps working on
+        machines where Chrome is installed somewhere unusual.
+
+    Raises:
+        RuntimeError: If an explicitly requested browser cannot be found.
+    """
+    if explicit_path:
+        binary_path = os.path.abspath(os.path.expanduser(explicit_path))
+        if not os.path.isfile(binary_path):
+            raise RuntimeError(f"Browser binary not found: {binary_path}")
+
+        label = BROWSER_LABELS.get(browser_key, "Custom browser")
+        return label, binary_path
+
+    if browser_key == "auto":
+        for key in AUTO_DETECT_ORDER:
+            binary_path = find_browser_binary(key, platform_name)
+            if binary_path:
+                return BROWSER_LABELS[key], binary_path
+
+        print(
+            "Warning: no Chrome, Brave, or Chromium install was detected; "
+            "letting ChromeDriver pick a browser."
+        )
+        return "ChromeDriver default", None
+
+    binary_path = find_browser_binary(browser_key, platform_name)
+    if binary_path:
+        return BROWSER_LABELS[browser_key], binary_path
+
+    searched = browser_candidate_paths(browser_key, platform_name)
+    locations = "\n  ".join(searched) if searched else "(no known locations)"
+    raise RuntimeError(
+        f"{BROWSER_LABELS[browser_key]} was not found. Looked in:\n"
+        f"  {locations}\n"
+        "Pass the executable explicitly with --browser-path, or use "
+        "--browser auto."
+    )
+
+
+def build_browser_options(runtime_profile_dir, headless, binary_path=None):
+    """Create Chromium options for reliable headless PDF generation."""
     options = Options()
+
+    if binary_path:
+        options.binary_location = binary_path
 
     if headless:
         options.add_argument("--headless=new")
@@ -1040,6 +1258,18 @@ def build_argument_parser():
         action="store_true",
         help="Show the browser window (useful when debugging rendering)",
     )
+    parser.add_argument(
+        "--browser",
+        choices=BROWSER_CHOICES,
+        help=(
+            "Which Chromium-based browser to drive: auto (default) tries "
+            "Chrome, then Brave, then Chromium"
+        ),
+    )
+    parser.add_argument(
+        "--browser-path",
+        help="Path to the browser executable, overriding auto-detection",
+    )
     return parser
 
 
@@ -1059,12 +1289,20 @@ def run(args):
 
     try:
         output_path = resolve_output_path(args, input_url, document_id)
+        browser_label, browser_binary = resolve_browser(
+            settings.browser,
+            settings.browser_path,
+        )
     except (RuntimeError, OSError) as error:
         print(f"Error: {error}")
         return EXIT_FAILURE
 
     print(f"Link embed: {embed_url}")
     print(f"Output file: {output_path}")
+    if browser_binary:
+        print(f"Browser: {browser_label} ({browser_binary})")
+    else:
+        print(f"Browser: {browser_label}")
 
     with tempfile.TemporaryDirectory(
         prefix="scribd-chrome-profile-"
@@ -1072,11 +1310,12 @@ def run(args):
         driver = None
 
         try:
-            print("\nStarting Chrome browser...")
+            print(f"\nStarting {browser_label if browser_binary else 'browser'}...")
             driver = webdriver.Chrome(
-                options=build_chrome_options(
+                options=build_browser_options(
                     runtime_profile_dir,
                     settings.headless,
+                    browser_binary,
                 )
             )
 

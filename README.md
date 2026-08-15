@@ -57,7 +57,7 @@
 ## Requirements
 
 - Python 3.10 or higher
-- Google Chrome browser installed
+- A Chromium-based browser: Google Chrome, Brave, or Chromium
 - Chrome WebDriver (auto-managed by Selenium)
 
 ---
@@ -106,6 +106,8 @@ document id (`123456789`) all work too.
 | `--timeout SECONDS` | ChromeDriver command timeout for printing (default: `600`) |
 | `--page-timeout SECONDS` | Per-batch page and image load timeout (default: `120`) |
 | `--no-headless` | Show the browser window while debugging rendering |
+| `--browser NAME` | `auto` (default), `chrome`, `brave`, or `chromium` |
+| `--browser-path PATH` | Path to the browser executable, overriding auto-detection |
 
 Examples:
 
@@ -115,7 +117,35 @@ python scribd-downloader.py 123456789 --pages 1-20 -o ~/Documents/sample.pdf
 
 # Lower memory use on a very long, image-heavy document
 python scribd-downloader.py <url> --batch-size 4 --page-timeout 180
+
+# Use Brave instead of Chrome
+python scribd-downloader.py <url> --browser brave --pages 1-3 --no-headless
 ```
+
+### Choosing a browser
+
+Any Chromium-based browser driven by ChromeDriver works. By default the script
+looks for Google Chrome, then Brave, then Chromium, and reports what it picked:
+
+```text
+Browser: Brave (C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe)
+```
+
+Pin one explicitly with `--browser`, or point at an executable directly when it
+is installed somewhere unusual:
+
+```bash
+python scribd-downloader.py <url> --browser brave
+python scribd-downloader.py <url> --browser-path "C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
+```
+
+Detection covers the standard install locations: the Windows registry and
+`Program Files` / `Local AppData`, `/Applications` on macOS, and `PATH` plus
+`/opt` on Linux. When a named browser is missing, the error lists every path
+that was searched.
+
+Firefox and Safari are not supported — the exporter depends on Chrome DevTools
+Protocol commands that only Chromium-based browsers provide.
 
 The exit code is `0` on success, `1` on failure, and `130` when cancelled with Ctrl+C.
 
@@ -211,6 +241,20 @@ The script uses Selenium Manager to auto-download ChromeDriver. If you face issu
 pip install --upgrade selenium
 ```
 
+### "Brave was not found" (or Chrome, or Chromium)
+The error lists every location that was searched. If the browser lives somewhere
+else, point at it directly:
+```bash
+python scribd-downloader.py <url> --browser-path "<full path to the executable>"
+```
+
+### "This version of ChromeDriver only supports Chrome version N"
+The driver Selenium downloaded does not match the browser's Chromium version.
+This shows up most often with Brave, which tracks a different release cadence
+than Chrome. Update the browser, then `pip install --upgrade selenium`. Failing
+that, `--browser chrome` usually resolves cleanly because Selenium Manager
+matches Chrome versions directly.
+
 ### PDF not saving
 - Ensure you have write permissions in the current directory
 - Check if the Scribd URL is valid and accessible
@@ -246,6 +290,8 @@ defaults when the matching flag is not passed:
 | `SCRIBD_PAGE_LOAD_TIMEOUT` | `--page-timeout` | `120` |
 | `SCRIBD_EXPORT_BATCH_SIZE` | `--batch-size` | `8` |
 | `SCRIBD_HEADLESS=0` | `--no-headless` | headless on |
+| `SCRIBD_BROWSER` | `--browser` | `auto` |
+| `SCRIBD_BROWSER_PATH` | `--browser-path` | auto-detected |
 
 ---
 

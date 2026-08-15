@@ -255,6 +255,239 @@ class TestResolveOutputPath:
         assert target.parent.is_dir()
 
 
+class TestBrowserCandidatePaths:
+    def test_windows_uses_program_files_and_local_appdata(
+        self, downloader, monkeypatch
+    ):
+        monkeypatch.setattr(downloader, "windows_registry_browser_paths", lambda _: [])
+        monkeypatch.setenv("ProgramFiles", r"C:\Program Files")
+        monkeypatch.setenv("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\me\AppData\Local")
+
+        paths = downloader.browser_candidate_paths("brave", platform_name="win32")
+
+        assert any("Program Files" in path for path in paths)
+        assert any("AppData" in path for path in paths)
+        assert all(path.endswith("brave.exe") for path in paths)
+
+    def test_windows_registry_hits_come_first(self, downloader, monkeypatch):
+        monkeypatch.setattr(
+            downloader,
+            "windows_registry_browser_paths",
+            lambda _: [r"D:\Custom\brave.exe"],
+        )
+        monkeypatch.setenv("ProgramFiles", r"C:\Program Files")
+        monkeypatch.delenv("ProgramFiles(x86)", raising=False)
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+
+        paths = downloader.browser_candidate_paths("brave", platform_name="win32")
+
+        assert paths[0] == r"D:\Custom\brave.exe"
+
+    def test_windows_skips_missing_environment_roots(self, downloader, monkeypatch):
+        monkeypatch.setattr(downloader, "windows_registry_browser_paths", lambda _: [])
+        monkeypatch.delenv("ProgramFiles", raising=False)
+        monkeypatch.delenv("ProgramFiles(x86)", raising=False)
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+
+        assert downloader.browser_candidate_paths("chrome", platform_name="win32") == []
+
+    def test_macos_includes_user_applications(self, downloader):
+        paths = downloader.browser_candidate_paths("chrome", platform_name="darwin")
+
+        assert "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" in paths
+        assert any(not path.startswith("/Applications") for path in paths)
+
+    def test_linux_resolves_names_on_path(self, downloader, monkeypatch):
+        monkeypatch.setattr(
+            downloader.shutil,
+            "which",
+            lambda name: "/usr/bin/brave-browser" if name == "brave-browser" else None,
+        )
+
+        paths = downloader.browser_candidate_paths("brave", platform_name="linux")
+
+        assert "/usr/bin/brave-browser" in paths
+        assert "/opt/brave.com/brave/brave" in paths
+
+    def test_duplicates_are_dropped(self, downloader, monkeypatch):
+        monkeypatch.setattr(
+            downloader.shutil, "which", lambda name: "/opt/brave.com/brave/brave"
+        )
+
+        paths = downloader.browser_candidate_paths("brave", platform_name="linux")
+
+        assert len(paths) == len(set(paths))
+
+
+class TestResolveBrowser:
+    def test_explicit_path_wins(self, downloader, tmp_path):
+        binary = tmp_path / "brave.exe"
+        binary.write_text("")
+
+        label, path = downloader.resolve_browser("brave", str(binary))
+
+        assert label == "Brave"
+        assert path == str(binary)
+
+    def test_explicit_path_must_exist(self, downloader, tmp_path):
+        missing = tmp_path / "nope.exe"
+
+        with pytest.raises(RuntimeError, match="not found"):
+            downloader.resolve_browser("brave", str(missing))
+
+    def test_explicit_path_with_auto_is_labelled_custom(self, downloader, tmp_path):
+        binary = tmp_path / "some-browser"
+        binary.write_text("")
+
+        label, _ = downloader.resolve_browser("auto", str(binary))
+
+        assert label == "Custom browser"
+
+    def test_auto_prefers_chrome(self, downloader, monkeypatch):
+        monkeypatch.setattr(
+            downloader,
+            "find_browser_binary",
+            lambda key, platform_name=None: f"/bin/{key}",
+        )
+
+        assert downloader.resolve_browser("auto") == ("Google Chrome", "/bin/chrome")
+
+    def test_auto_falls_through_to_brave(self, downloader, monkeypatch):
+        monkeypatch.setattr(
+            downloader,
+            "find_browser_binary",
+            lambda key, platform_name=None: "/bin/brave" if key == "brave" else None,
+        )
+
+        assert downloader.resolve_browser("auto") == ("Brave", "/bin/brave")
+
+    def test_auto_falls_back_to_chromedriver_default(self, downloader, monkeypatch):
+        monkeypatch.setattr(
+            downloader, "find_browser_binary", lambda key, platform_name=None: None
+        )
+
+        label, path = downloader.resolve_browser("auto")
+
+        assert path is None
+        assert label == "ChromeDriver default"
+
+    def test_named_browser_missing_is_an_error(self, downloader, monkeypatch):
+        monkeypatch.setattr(
+            downloader, "find_browser_binary", lambda key, platform_name=None: None
+        )
+        monkeypatch.setattr(
+            downloader,
+            "browser_candidate_paths",
+            lambda key, platform_name=None: [r"C:\Program Files\brave.exe"],
+        )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            downloader.resolve_browser("brave")
+
+        message = str(excinfo.value)
+        assert "Brave was not found" in message
+        assert r"C:\Program Files\brave.exe" in message
+        assert "--browser-path" in message
+
+    def test_named_browser_found(self, downloader, monkeypatch):
+        monkeypatch.setattr(
+            downloader,
+            "find_browser_binary",
+            lambda key, platform_name=None: "/opt/chromium",
+        )
+
+        assert downloader.resolve_browser("chromium") == ("Chromium", "/opt/chromium")
+
+
+class TestBuildBrowserOptions:
+    def test_binary_location_is_set(self, downloader, tmp_path):
+        options = downloader.build_browser_options(str(tmp_path), True, "/bin/brave")
+
+        assert options.binary_location == "/bin/brave"
+
+    def test_binary_location_left_alone_without_a_path(self, downloader, tmp_path):
+        options = downloader.build_browser_options(str(tmp_path), True, None)
+
+        assert options.binary_location == ""
+
+    def test_headless_flag_follows_the_setting(self, downloader, tmp_path):
+        headless = downloader.build_browser_options(str(tmp_path), True)
+        windowed = downloader.build_browser_options(str(tmp_path), False)
+
+        assert "--headless=new" in headless.arguments
+        assert "--headless=new" not in windowed.arguments
+
+    def test_profile_directory_is_passed_through(self, downloader, tmp_path):
+        options = downloader.build_browser_options(str(tmp_path), True)
+
+        assert f"--user-data-dir={tmp_path}" in options.arguments
+
+
+class TestBrowserSettings:
+    def test_defaults_to_auto(self, downloader, monkeypatch):
+        monkeypatch.delenv("SCRIBD_BROWSER", raising=False)
+        monkeypatch.delenv("SCRIBD_BROWSER_PATH", raising=False)
+        args = downloader.build_argument_parser().parse_args(["123456789"])
+        settings = downloader.ExportSettings.from_args(args)
+
+        assert settings.browser == "auto"
+        assert settings.browser_path is None
+
+    def test_environment_supplies_browser(self, downloader, monkeypatch):
+        monkeypatch.setenv("SCRIBD_BROWSER", "brave")
+        monkeypatch.setenv("SCRIBD_BROWSER_PATH", r"C:\brave.exe")
+        args = downloader.build_argument_parser().parse_args(["123456789"])
+        settings = downloader.ExportSettings.from_args(args)
+
+        assert settings.browser == "brave"
+        assert settings.browser_path == r"C:\brave.exe"
+
+    def test_flags_win_over_environment(self, downloader, monkeypatch):
+        monkeypatch.setenv("SCRIBD_BROWSER", "chromium")
+        args = downloader.build_argument_parser().parse_args(
+            ["123456789", "--browser", "brave"]
+        )
+
+        assert downloader.ExportSettings.from_args(args).browser == "brave"
+
+    def test_bad_environment_value_falls_back(self, downloader, monkeypatch):
+        monkeypatch.setenv("SCRIBD_BROWSER", "firefox")
+        args = downloader.build_argument_parser().parse_args(["123456789"])
+
+        assert downloader.ExportSettings.from_args(args).browser == "auto"
+
+    def test_parser_rejects_unknown_browser(self, downloader):
+        with pytest.raises(SystemExit):
+            downloader.build_argument_parser().parse_args(
+                ["123456789", "--browser", "firefox"]
+            )
+
+
+class TestEnvChoice:
+    def test_returns_allowed_value(self, downloader, monkeypatch):
+        monkeypatch.setenv("SCRIBD_TEST_CHOICE", "brave")
+        assert downloader.env_choice("SCRIBD_TEST_CHOICE", "auto", ("auto", "brave")) == (
+            "brave"
+        )
+
+    def test_is_case_insensitive(self, downloader, monkeypatch):
+        monkeypatch.setenv("SCRIBD_TEST_CHOICE", "BRAVE")
+        assert downloader.env_choice("SCRIBD_TEST_CHOICE", "auto", ("auto", "brave")) == (
+            "brave"
+        )
+
+    def test_unknown_value_falls_back(self, downloader, monkeypatch):
+        monkeypatch.setenv("SCRIBD_TEST_CHOICE", "opera")
+        assert downloader.env_choice("SCRIBD_TEST_CHOICE", "auto", ("auto", "brave")) == (
+            "auto"
+        )
+
+    def test_unset_returns_default(self, downloader, monkeypatch):
+        monkeypatch.delenv("SCRIBD_TEST_CHOICE", raising=False)
+        assert downloader.env_choice("SCRIBD_TEST_CHOICE", "auto", ("auto",)) == "auto"
+
+
 class TestArgumentParser:
     def test_url_is_optional(self, downloader):
         assert downloader.build_argument_parser().parse_args([]).url is None
@@ -275,8 +508,14 @@ class TestArgumentParser:
                 "--page-timeout",
                 "180",
                 "--no-headless",
+                "--browser",
+                "brave",
+                "--browser-path",
+                r"C:\brave.exe",
             ]
         )
+        assert args.browser == "brave"
+        assert args.browser_path == r"C:\brave.exe"
         assert args.output == "out.pdf"
         assert args.force is True
         assert args.pages == "1-5"
