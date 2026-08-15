@@ -37,7 +37,8 @@
 ## Features
 
 - **One-click download** - Just paste the Scribd URL and get your PDF
-- **Supports both Scribd URL styles** - Works with `/document/...` and legacy `/doc/...` links
+- **Real CLI** - Pass the URL as an argument, choose the output path, or export a page range
+- **Flexible URL input** - `/document/...`, legacy `/doc/...`, `/presentation/...`, `/embeds/...`, or a bare document id
 - **Runs in background** - Headless Chrome, no browser window pops up
 - **No scrolling required** - Loads Scribd page data directly instead of simulating page-by-page scrolling
 - **Clean PDFs** - No cookie banners, toolbars, or watermarks
@@ -47,8 +48,9 @@
 - **Better math rendering** - Preserves Scribd layout classes needed by equations and SVG content
 - **Exact pagination** - Validates that every Scribd page produces exactly one PDF sheet
 - **Dynamic page size** - Detects each rendered page's dimensions instead of forcing one fixed sheet size
-- **Auto filename** - PDF named after the document URL automatically
-- **No login required** - Works without Scribd account
+- **Auto filename** - PDF named after the document URL automatically, with unsafe characters stripped
+- **No accidental overwrites** - Refuses to clobber an existing file unless you pass `--force`
+- **No login required** - Works with publicly viewable documents, without a Scribd account
 
 ---
 
@@ -77,41 +79,65 @@
 
 ## Usage
 
-1. **Run the script**
-   ```bash
-   python scribd-downloader.py
-   ```
+Pass the URL directly:
 
-2. **Paste the Scribd document URL** when prompted:
-   ```
-   Input link Scribd: https://www.scribd.com/document/123456789/Document-Title
-   ```
+```bash
+python scribd-downloader.py https://www.scribd.com/document/123456789/Document-Title
+```
 
-   Legacy Scribd URLs also work:
-   ```
-   Input link Scribd: https://www.scribd.com/doc/123456789/Document-Title
-   ```
+Or run it with no arguments and paste the URL when prompted:
 
-3. **Wait for the download** - The script will:
-   - Open the document in headless Chrome
-   - Load document pages directly in bounded batches
-   - Release each batch from Chrome after printing to control memory use
-   - Remove unwanted elements (toolbars, cookie banners)
-   - Spool individual pages to temporary storage and merge the final PDF
-   - Save the PDF in the current directory
+```bash
+python scribd-downloader.py
+Input link Scribd: https://www.scribd.com/document/123456789/Document-Title
+```
 
-4. **Done!** Your PDF will be saved with the document name from the URL.
+Legacy `/doc/...` links, `/presentation/...` links, `/embeds/...` links, and a bare
+document id (`123456789`) all work too.
+
+### Options
+
+| Flag | Description |
+|------|-------------|
+| `-o`, `--output PATH` | Output PDF path, or an existing directory (default: derived from the URL) |
+| `-f`, `--force` | Overwrite the output file if it already exists |
+| `-p`, `--pages SPEC` | Pages to export, e.g. `1-20` or `1-5,12,40-60` (default: all) |
+| `--batch-size N` | Pages kept fully loaded in Chrome at once (default: `8`) |
+| `--timeout SECONDS` | ChromeDriver command timeout for printing (default: `600`) |
+| `--page-timeout SECONDS` | Per-batch page and image load timeout (default: `120`) |
+| `--no-headless` | Show the browser window while debugging rendering |
+
+Examples:
+
+```bash
+# Export only the first 20 pages to a chosen path
+python scribd-downloader.py 123456789 --pages 1-20 -o ~/Documents/sample.pdf
+
+# Lower memory use on a very long, image-heavy document
+python scribd-downloader.py <url> --batch-size 4 --page-timeout 180
+```
+
+The exit code is `0` on success, `1` on failure, and `130` when cancelled with Ctrl+C.
+
+### What happens during a run
+
+The script will:
+
+- Open the document in headless Chrome
+- Load document pages directly in bounded batches
+- Release each batch from Chrome after printing to control memory use
+- Remove unwanted elements (toolbars, cookie banners)
+- Spool individual pages to temporary storage and merge the final PDF
+- Save the PDF to the chosen path, or to the current directory by default
 
 ---
 
 ## Example Output
 
 ```text
-$ python scribd-downloader.py
-Input link Scribd: https://www.scribd.com/document/903361807/WorkdaySimpleIntegrations-EIB-31v2
-
+$ python scribd-downloader.py https://www.scribd.com/document/903361807/WorkdaySimpleIntegrations-EIB-31v2
 Link embed: https://www.scribd.com/embeds/903361807/content
-Output filename: WorkdaySimpleIntegrations-EIB-31v2.pdf
+Output file: C:\Users\...\WorkdaySimpleIntegrations-EIB-31v2.pdf
 
 Starting Chrome browser...
 Cookie dialogs hidden.
@@ -120,10 +146,12 @@ Bottom toolbar removed.
 Adjusted 1 scroll containers for print.
 Print CSS injected.
 
-Saving PDF as: WorkdaySimpleIntegrations-EIB-31v2.pdf
+Saving PDF as: C:\Users\...\WorkdaySimpleIntegrations-EIB-31v2.pdf
   Export mode: Individual document pages
   Margins: None
   Headers/Footers: Disabled
+  Document pages: 316
+  Selected pages: 316
   ChromeDriver command timeout: 600s
 Exporting 316 document pages in bounded batches of 8...
   Loading page batch 1-8/316...
@@ -132,6 +160,7 @@ Exporting 316 document pages in bounded batches of 8...
   ...
 Merging 316 disk-spooled PDF pages...
 PDF saved successfully to: C:\Users\...\WorkdaySimpleIntegrations-EIB-31v2.pdf
+  228.49 MB in 58.4s
 Browser closed.
 ```
 
@@ -187,33 +216,51 @@ pip install --upgrade selenium
 - Check if the Scribd URL is valid and accessible
 - For very large documents, increase `SCRIBD_CDP_TIMEOUT` (default: `600`)
 
+### "No printable document pages were detected"
+The document is private, removed, or preview-only. Only publicly viewable documents can be exported.
+
 ### Blank pages in PDF
 - Some documents may have DRM protection
-- Try increasing `SCRIBD_PAGE_LOAD_TIMEOUT` if page images load slowly
-- If a document still renders incorrectly, try visible mode with `SCRIBD_HEADLESS=0`
+- Try increasing `--page-timeout` if page images load slowly
+- If a document still renders incorrectly, try visible mode with `--no-headless`
 
 ### Very large documents
 - Ensure the drive containing your temporary directory has enough free space for individual page PDFs
-- Reduce `SCRIBD_EXPORT_BATCH_SIZE` if Chrome uses too much memory
-- Increase `SCRIBD_PAGE_LOAD_TIMEOUT` when slow image assets time out
+- Reduce `--batch-size` if Chrome uses too much memory
+- Increase `--page-timeout` when slow image assets time out
+- Use `--pages` to export a slice at a time
 - Long documents still take time because each page is printed and validated separately
 
 ### Large, image-heavy, or math-heavy documents
-You can tune the export with environment variables:
 
-```powershell
-$env:SCRIBD_CDP_TIMEOUT="900"
-$env:SCRIBD_PAGE_LOAD_TIMEOUT="180"
-$env:SCRIBD_EXPORT_BATCH_SIZE="4"
-python scribd-downloader.py
+```bash
+python scribd-downloader.py <url> --timeout 900 --page-timeout 180 --batch-size 4
 ```
 
-Useful variables:
+The same settings can be supplied through environment variables, which act as
+defaults when the matching flag is not passed:
 
-- `SCRIBD_CDP_TIMEOUT` - ChromeDriver command timeout in seconds for `Page.printToPDF`
-- `SCRIBD_PAGE_LOAD_TIMEOUT` - Maximum direct page-loading time in seconds (default: `120`)
-- `SCRIBD_EXPORT_BATCH_SIZE` - Maximum fully loaded pages kept in Chrome at once (default: `8`)
-- `SCRIBD_HEADLESS=0` - Run with a visible browser when debugging rendering issues locally
+| Variable | Flag | Default |
+|----------|------|---------|
+| `SCRIBD_CDP_TIMEOUT` | `--timeout` | `600` |
+| `SCRIBD_PAGE_LOAD_TIMEOUT` | `--page-timeout` | `120` |
+| `SCRIBD_EXPORT_BATCH_SIZE` | `--batch-size` | `8` |
+| `SCRIBD_HEADLESS=0` | `--no-headless` | headless on |
+
+---
+
+## Development
+
+Install the development dependencies and run the test suite:
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The tests cover the pure helpers (URL parsing, filename sanitizing, page-range
+parsing, output-path resolution, settings precedence) and need neither Chrome
+nor network access.
 
 ---
 
